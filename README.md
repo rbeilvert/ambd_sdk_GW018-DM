@@ -1,266 +1,408 @@
-# AmebaD SDK adjusted for Tuya GW018-DM gateway
-The purpose of this is to cut the GW108-DM gateway from the cloud and use it as Zigbee Adapter in HomeAssistant (e. g. via Zigbee2MQTT). The firmware is basically the same as https://github.com/parasite85/rtl_firmware, but with some small adjustments for AmebaD (WBRG1 module, RTL8721CSM) instead of Ameba1 (WRG1 module, RTL8711AM) based on the discussion [here](https://github.com/MattWestb/EFR32-FW/issues/6).
+# AmebaD firmware for the Tuya GW018-DM gateway
 
-**Work in Progress! Use this at your own risk! And consider making a backup before!**
+Replaces both firmwares on a Tuya GW018-DM / RSH-GW018 DM gateway so it works
+as a local Zigbee coordinator with no cloud dependency. The WiFi module joins
+your network and bridges the Zigbee module's UART to a TCP socket;
+Zigbee2MQTT connects to that socket and pairs any standard Zigbee 3.0 device,
+regardless of vendor.
 
-## 1) Connect to the device via UART
-Open up the plastic case and remove the single screw. Solder pin headers to the PCB in P1 area. Connect them with jumper cables to a UART-TTL to USB adapter. Pin assignment is from left (outer edge) to right:
+**No SWD debugger is required.** The Zigbee module's Gecko bootloader is
+unprotected and reachable over the TCP bridge once the WiFi firmware is
+running, so its firmware is flashed over the network.
 
-* GND -> connect to GND on UART adapter
-* TX -> connect to RX on UART adapter
-* RX -> connect to TX on UART adapter
-* VCC (?) -> don't connect anything here
+Based on [parasite85/rtl_firmware](https://github.com/parasite85/rtl_firmware),
+adapted for AmebaD, on top of
+[Seeed-Studio/seeed-ambd-sdk](https://github.com/Seeed-Studio/seeed-ambd-sdk).
 
-![UART connection](uart.jpg)
+**Flashing firmware can leave a device unusable. Make the backup in step 3.**
 
-Plugin the UART-TTL to USB adapter into your computer's USB port.
+## Hardware
 
-## 2) Make a backup of the Realtek's chip external flash
-You need to get into a special "command mode" in order to create a backup. We need to communicate to the gateway via UART to do that. I'm using minicom for that purpose:
-```
-# install it first – use your system's package manager
-sudo dnf install minicom
-# now start it and connect to the gateway – use the right device path, in my case it's /dev/ttyUSB0
-minicom -b 115200 -D /dev/ttyUSB0
-```
-If you plug in the UART adapter into your computer's USB port and connect the gateway to power afterwards, you will see the boot messages of your gateway flickering on the screen. 
+| Part | Device | Notes |
+| --- | --- | --- |
+| WiFi / BLE module | WBRG1 = RTL8721CSM | AmebaD, KM4 (Cortex-M33) + KM0 (Cortex-M23), 8 MB flash |
+| Zigbee module | ZS3L = EFR32MG21A020F768IM32-B | Same part as a Sonoff ZBDongle-E |
+| Zigbee bootloader | Gecko 1.9.2 | Unprotected, accepts XMODEM uploads |
+| Stock Zigbee firmware | EmberZNet 6.5.5.0 build 432 | Too old for Zigbee2MQTT; replaced in step 7 |
+| Console | 115200 8N1 | Line endings are `\n\r` |
 
-You'll have to do it the other way round in order to get into the command mode: Leave minicom open, unplug the gateway from power and the UART adapter from your PC – then reconnect it: This time power on the gateway first and plugin the UART adapter second. You will see nothing but a blinking cursor – but that's how it should be!
+### Board variants
 
-Now enter minicom settings (pressing "ctrl" + "a" and then "o") and disable hardware flow control by entering "Serial port setup" and pressing "f". Press enter, close settings. Now press and hold ESC – if everything works fine, a shell "#" will pop up. You can type in "?" and press enter to see a list of available commmands:
-```
-#?
------------------ COMMAND MODE HELP ------------------
-        HELP (?) 
-                 Print this help messag
+At least two board revisions exist, with the same modules on different
+layouts. **Identify yours by the silkscreen printed next to the pins, not by
+the connector number** -- both the numbering and the pin order differ.
 
-        DW 
-                 <Address, Hex> <Len, Dec>: 
-                 Dump memory word or Read Hw word register
-        EW 
-                 <Address, Hex> <Value, Hex>: 
-                 Write memory word or Write Hw word register 
-                 Can write one word at the same time 
-                 Ex: EW Address Value0 Value1
-        FLASH 
-                 erase chip 
-                 erase sector addr 
-                 erase block addr 
-                 read addr len 
-                 write addr data 
+| | Green board | Blue board |
+| --- | --- | --- |
+| Silkscreen | `GW018-DM-C -V1.0` | `JZZWG-TY2.0` |
+| Console header | `P1` | `P4` |
+| Pins, in silkscreen order | `GND` `TX` `RX` `VCC` | `CHIP_EN` `LOG_RX` `LOG_TX` `TX` `RX` `GND` `VCC` |
+| Console pins | `TX` / `RX` | `LOG_TX` / `LOG_RX` |
+| SWD header | not documented | `P3` |
 
-        EFUSE 
-                 wmap addr len data
-                 rmap 
-                 autoload 
+Headers are unpopulated 2.54 mm through holes on both revisions.
 
-        REBOOT 
-                 <item, string> : 
-                 item: uartburn or N/A 
-                 
+On the **blue board**, the pins labelled plain `TX` and `RX` are a different
+WBRG1 UART, not the console. Wiring to them produces no output. Use
+`LOG_TX` / `LOG_RX`.
 
------------------ COMMAND MODE END  ------------------
-#
-```
-We want to make a dump of the flash – so the "flash read" command would be the right one. But wait: We have to save the output somewhere. So press "ctrl" + "a" again followed by "l" to save minicom log in a file. Name it like you want and press enter. Let's read the flash (found address and length by trial and error):
-```
-flash read 0 2097152
-```
-And the flash will be printed as hex code on your screen. This might take a while. Have a coffee or a nap in the meantime. Exit minicom afterwards by pressing "ctrl" + "a" followed by "x", open the logfile in a text editor, make sure you only keep the dump (starting with `00000000:` and ending with `007ffff0: 7c8bfc05 b410f5f8  14a25132 5f239f20` in my case) and save it. Then convert it into a binary file (maybe there is a much cleaner way to do this – I just could'nt find any):
-```
-awk -F' ' '{print $2$3$4$5}' myfirmwaredump.cap | xxd -r -p | xxd -e | awk -F' ' '{print $2$3$4$5}' | xxd -r -p > wbrg1-firmware.bin
-```
-Congratulations! You now have a backup and theoretically you can restore it (or parts of it) using ImageTool in case anything goes wrong.
+`VCC` on both revisions is the 3.3 V AMS1117 output. Do not feed it.
 
-## 3) Build the new firmware
-Now it's time to clone this repo, install the needed dependencies and build the gateway's new firmware out of the AmebaD sdk :)
-```
-# Dependencies: on a 64-bit host, make is all you actually need.
-sudo dnf install make          # Fedora
-sudo apt install make          # Debian/Ubuntu
+`CHIP_EN` exists on the blue board only. Leave it unconnected; grounding it
+holds the WBRG1 off.
 
-# Shallow-clone: the full history is ~1.6 GB.
-git clone --depth 1 --single-branch --branch dev \
-  https://github.com/jasperw1996/ambd_sdk_GW018-DM
+The blue board's `P3` carries, in silkscreen order:
 
-cd ambd_sdk_GW018-DM/project/realtek_amebaD_va0_example/GCC-RELEASE/project_lp/
-make all
-cd ../project_hp/
-make all
-```
+    P3:  Z-SWDIO  Z-SWCLK  433SWDIO  433SWCLK  M-RST  RXD  TXD
 
-**On the 32-bit packages.** Earlier revisions of this README asked for
-`glibc-devel.i686` and `ncurses-compat-libs.i686`. Those belong to the i686
-fallback path only. The toolchain is not a system package and is not committed
-as a binary: `project_hp/toolchain/asdk/` holds split archives that
-`toolchain/Makefile` concatenates and unpacks on the first build, and it
-branches on `uname -p`. An `x86_64` host therefore gets
-`asdk-6.4.1-linux-newlib-build-3026-x86_64`, which is a genuine 64-bit ELF
-running `arm-none-eabi-gcc 6.4.1` -- no multilib involved. Verified by building
-both cores from a clean clone on x86_64 Ubuntu with only `make` installed.
+All seven are signals -- **there is no GND or VCC on P3**, so take ground
+from the console header. P3 is only needed to recover the Zigbee module over
+SWD. No 433 MHz module is fitted, so the `433*` pins are unused.
 
-**If you clone with the GitHub CLI configured for SSH,** plain
-`git clone https://...` can fail with `could not read Username for
-'https://github.com'`, which looks like a private repository but is not. Use
-`gh repo clone jasperw1996/ambd_sdk_GW018-DM -- --depth 1` instead. Note that
-`gh` also adds the `Seeed-Studio/seeed-ambd-sdk` upstream remote and fetches
-its refs, which takes the working copy from ~1.6 GB to ~2.3 GB on disk.
-If everything goes fine, you should see a `========== Image manipulating end ==========` at the end of each make process.
+## What you need
 
-**About "error 127".** It is `command not found`: the bundled helper scripts
-the Makefiles invoke had lost their execute bit in the tree. That is now fixed
-at the source -- the 27 `.sh` scripts under `GCC-RELEASE/` are committed mode
-`100755` -- so the `chmod -R 777 ./` workaround should no longer be necessary.
-If you do hit it, prefer a targeted fix over recursive 777, which also marks
-data files, `.bin` images and `.txt` GDB scripts executable:
-```
-find . -name '*.sh' -exec chmod +x {} \;
-make clean && make all
-```
+* A 3.3 V or 5 V USB-UART adapter that supports 921600 baud
+* A 2.54 mm header (4 pins on the green board, 7 on the blue) and a soldering iron
+* One 4.7 kOhm and one 10 kOhm resistor, **only if the adapter is 5 V**
+* `make`, `python3`, `minicom`, and
+  [universal-silabs-flasher](https://github.com/NabuCasa/universal-silabs-flasher)
 
-Finally you'll have a bunch of images in the `asdk/image` subdirectory of
-`project_lp` and `project_hp`. Three of them are needed in the next step. For a
-reference build of this branch they come out as:
+## 1. Wiring
 
-| image | bytes | from |
+Solder a header to your board's console connector and connect three wires.
+Power the gateway from its own USB-C connector throughout.
+
+| USB-UART adapter | Green board (`P1`) | Blue board (`P4`) |
+| --- | --- | --- |
+| `GND` | `GND` | `GND` |
+| `RXD` | `TX` | `LOG_TX` |
+| `TXD` | `RX` | `LOG_RX` |
+| `VCC` | leave unconnected | leave unconnected |
+
+A **5 V adapter** needs a divider on the line into the board's console RX
+pin. A 3.3 V adapter connects directly.
+
+    adapter TXD ---[ 4k7 ]---+--- console RX      (TX on green, LOG_RX on blue)
+                             |
+                          [ 10k ]
+                             |
+                            GND
+
+    adapter RXD ---------------- console TX       (direct, no divider)
+    adapter GND ---------------- board GND
+    adapter VCC ---------------- not connected
+
+The board's console TX needs no divider in the other direction: 3.3 V clears
+an FT232R's 2.0 V input threshold.
+
+| Rule | Reason |
+| --- | --- |
+| Never connect the adapter's VCC | A 5 V adapter puts 5 V onto the board's 3.3 V rail |
+| Never put a resistor to ground on the board's console **TX** pin | A pull-down there makes the chip enter UART download mode on every reset, so the console becomes unreachable |
+| Leave `CHIP_EN` unconnected (blue board) | Grounding it holds the WBRG1 off |
+
+![Green board wired to P1](docs/images/console-wiring-gw018-dm-c-v1.0.jpg)
+
+*Green `GW018-DM-C -V1.0`, three wires into `P1`, 3.3 V CP2102 adapter.*
+
+![Blue board wired to P4](docs/images/console-wiring-jzzwg-ty2.0.jpg)
+
+*Blue `JZZWG-TY2.0`, three wires into `P4`. The two resistors on the
+breadboard are the 4k7 / 10k divider needed for a 5 V adapter.*
+
+## 2. Console access
+
+The console runs at 115200 8N1 on both revisions. To reach the bootloader shell:
+
+1. Start minicom and leave it running: `minicom -b 115200 -D /dev/ttyUSB0`
+2. Disable hardware flow control: `Ctrl-A`, `O`, "Serial port setup", `F`,
+   Enter, Esc. Skip this and your keystrokes are ignored.
+3. Unplug **both** the gateway and the USB adapter.
+4. Plug the **gateway** in first, then the **adapter**.
+5. Hold ESC. A `#` prompt appears.
+
+Step 3 and 4 are required. Power-cycling the gateway with the adapter already
+connected does not reach the prompt, no matter how long ESC is held.
+
+Two quirks of this shell:
+
+* **The first character sent after the prompt appears is discarded.** Send a
+  newline before your first command, or `?` is swallowed and you get an empty
+  command and a fresh `#` instead of the help text.
+* If you script this, do not detect the prompt by searching for `#`. The boot
+  output contains the literal text `#example_sw_pta_init success.`. The
+  prompt leaves the stream ending in `#` and then idle.
+
+`?` lists the commands: `HELP`, `DW`, `EW`, `FLASH`, `EFUSE`, `REBOOT`.
+
+## 3. Back up the WBRG1 flash
+
+Do this before flashing anything. It is the only way back to stock.
+
+In minicom, start a capture with `Ctrl-A` then `L` and name the file, then:
+
+    flash read 0 2097152
+
+**The length is in 32-bit words, not bytes.** 2097152 * 4 = 8388608, which is
+the whole 8 MB chip. Confirm with `flash read 0 64`: it returns 16 lines
+covering `00000000` to `000000f0`, i.e. 256 bytes for 64 words.
+
+The dump takes about 40 minutes and produces roughly 27 MB of text ending at
+address `007ffff0`. Do not shorten it: the device keys are near the top of the
+chip, at `0x7d7000`.
+
+Exit minicom (`Ctrl-A`, `X`), strip everything before the first `00000000:`
+line and after the last, then convert:
+
+    awk -F' ' '{print $2$3$4$5}' dump.cap \
+      | xxd -r -p | xxd -e | awk -F' ' '{print $2$3$4$5}' \
+      | xxd -r -p > wbrg1-stock.bin
+
+The second `xxd` pass swaps the word endianness. Check the result:
+
+| Check | Expected |
+| --- | --- |
+| File size | 8388608 bytes |
+| Data lines in the capture | 524288 |
+| First 8 bytes | `99 99 96 96 3f cc 66 fc` (Realtek AmebaD image signature) |
+
+If the first bytes do not match, the endianness conversion did not work and
+the file is not a usable backup.
+
+## 4. Build the firmware
+
+On a 64-bit host `make` is the only dependency. The toolchain is not a system
+package: `project_hp/toolchain/asdk/` holds split archives that the build
+concatenates and unpacks on first use, selecting by `uname -p`. An x86_64 host
+gets `asdk-6.4.1-linux-newlib-build-3026-x86_64`, a 64-bit binary running
+arm-none-eabi-gcc 6.4.1. No 32-bit libraries are involved.
+
+    sudo apt install make          # or: sudo dnf install make
+
+    git clone --depth 1 --single-branch --branch dev \
+      https://github.com/rbeilvert/ambd_sdk_GW018-DM
+
+    cd ambd_sdk_GW018-DM/project/realtek_amebaD_va0_example/GCC-RELEASE
+    cd project_lp   && make all    # KM0
+    cd ../project_hp && make all    # KM4
+
+Build KM0 first: the two builds write into each other's `asdk/image/`
+directories and the KM4 pass assembles the combined image. Each ends with
+`========== Image manipulating end ==========`.
+
+The full history is about 1.6 GB, hence `--depth 1`.
+
+Three images are needed for step 5:
+
+| Image | Bytes | From |
 | --- | --- | --- |
 | `km0_boot_all.bin` | 4144 | `project_lp/asdk/image/` |
 | `km4_boot_all.bin` | 4208 | `project_hp/asdk/image/` |
 | `km0_km4_image2.bin` | 663552 | `project_hp/asdk/image/` |
 
-`km0_km4_image2.bin` is written into *both* image directories and the two
-copies are byte-identical, so either will do. The KM4 pass also prints
-`size = 663552` and `checksum 3f83757` as it finishes, which is a free
-sanity check on your own build.
+`km0_km4_image2.bin` is written to both image directories and the copies are
+identical. The KM4 pass prints `size = 663552` and `checksum 3f83757`.
 
-## 4) Flash the firmware to the gateway
-You can flash the new firmware to the gateway using Realtek ImageTool – there is a GUI for windows, but you might also use the Linux CLI from AmebaD Arduino SDK. Choose whatever you prefer :)
+## 5. Flash the WBRG1
 
-### a) Flash using ImageTool CLI (Linux)
-Download the [CLI executable from AmebaD Arduino SDK](https://github.com/ambiot/ambd_arduino/raw/dev/Arduino_package/ameba_d_tools_linux/upload_image_tool_linux). Grab `km0_boot_all.bin` from `project_lp` as well as `km4_boot_all.bin` and `km0_km4_image2.bin` from `project_hp` out of your build's image folders and put them in the same directory as the ImageTool executable. 
+Collect four files in one directory:
 
-The ImageTool for Linux can put your device into UART download mode automatically. All you have to do is connecting your gateway to your computer like you did before: Power up the gateway first and plugin the USB UART adapter to your computer afterwards. Then start flashing (make sure that your USB UART adapter supports a baudrate of `921600`):
-```
-# make the executable executable if you have not done so before:
-chmod +x upload_image_tool_linux
+    km0_boot_all.bin
+    km4_boot_all.bin
+    km0_km4_image2.bin
+    imgtool_flashloader_amebad.bin
 
-# Erase flash before flashing new firmware (may not be needed)
-./upload_image_tool_linux "$PWD" /dev/ttyUSB0 ameba_rtl8721csm Enable Enable 921600
+The flashloader is **required** and is not shipped with the tool. Copy it from
+this repository:
 
-# … and let's flash!
-./upload_image_tool_linux "$PWD" /dev/ttyUSB0 ameba_rtl8721csm Enable Disable 921600
-```
-You can see in the logs if the flashing process went well. If not – just flash it again, as long as you stay in `UART_DOWNLOAD` mode, everything should be fine. Make sure that flashing succeeded, then power off the gateway. Fire up minicom and power on the gateway again. You should see some boot logs again, containing `!!!!!!!!!!!!!!!! Hello from KM0 !!!!!!!!!!!!!!!!!!!!!!` and `!!!!!!!!!!!!!!!! Hello from KM4 1!!!!!!!!!!!!!!!!!!!!!!`. After a few seconds, you'll get a shell and can connect to your WiFi.
+    cp component/soc/realtek/amebad/imgtool_floader/image/imgtool_flashloader_amebad.bin .
 
-### b) Flash using ImageTool GUI (Windows)
+Without it the tool prints `Erase flash done!` while doing nothing, preceded
+by `error: stat imgtool_flashloader_amebad.bin failed` and
+`error: Flashloader download fail`.
 
-To prepare the flashing process you will have to reenter "Command Mode". Then, in minicom, after disabling hardware flow control again, type in `reboot uartburn` and press enter to put the device into `UART_DOWNLOAD` mode.
+Download the Linux CLI
+([upload_image_tool_linux](https://github.com/ambiot/ambd_arduino/raw/dev/Arduino_package/ameba_d_tools_linux/upload_image_tool_linux))
+into the same directory and `chmod +x` it.
 
-In the next step, you'll need a Windows 7 (+) environment to make use of the [ImageTool.exe from the original AmebaD SDK repo](https://github.com/ambiot/ambd_sdk/raw/dev/tools/AmebaD/Image_Tool/ImageTool.exe). Use a virtual machine or a Windows installation on a different device.
+**Use 921600.** At 115200 the tool writes part of the flashloader and then
+blocks indefinitely.
 
-Install .NET Framework 3.5, the drivers for your UART adapter and open ImageTool.exe. Click "Chip Select" and choose "AmebaD". Set baudrate to `115200` or `921600` (faster), if your UART USB adapter supports it. If your gateway is still in `UART_DOWNLOAD` mode and all drivers are installed correctly, you should see your UART adapter as a COM port.
+**Start the tool immediately after the device enters UART download mode.** In
+download mode the module sends NAK bytes (0x15) at about 20/s for a short
+while and then drops to about 0.7/s. The tool only synchronises during the
+fast phase. If you enter download mode by hand and then take a minute to type
+the command, it will hang.
 
-The new firmware is smaller than the old firmware, that's why I erased some parts of the flash manually – this may not be needed, but I think it's "cleaner" (?):
-1) Erase 16 KB starting from `0x08000000`
-2) Erase 8 KB starting from `0x08004000`
-3) Erase 1224 KB starting from `0x08006000`
+At the `#` prompt, put the module into download mode:
 
-Now grab `km0_boot_all.bin` from `project_lp` as well as `km4_boot_all.bin` and `km0_km4_image2.bin` from `project_hp` out of your build's image folders, put them on your Windows machine and select them in ImageTool:
+    reboot uartburn
 
-![ImageTool settings](imagetool.png)
+The console prints `#Flash Download Start` followed by a stream of 0x15
+bytes. Run the tool at once:
 
-Click on "Download", wish the best and wait a minute :) You can see in the logs if the flashing process went well. If not – just flash it again, as long as you stay in `UART_DOWNLOAD` mode, everything should be fine. Make sure that flashing succeeded, then power off the gateway. Connect it to your Linux machine again, fire up minicom and power on the gateway. You should see some boot logs again, containing `!!!!!!!!!!!!!!!! Hello from KM0 !!!!!!!!!!!!!!!!!!!!!!` and `!!!!!!!!!!!!!!!! Hello from KM4 1!!!!!!!!!!!!!!!!!!!!!!`. After a few seconds, you'll get a shell and can connect to your WiFi.
+    ./upload_image_tool_linux "$PWD" /dev/ttyUSB0 ameba_rtl8721csm Enable Disable 921600
 
+Scripting the two steps together is the reliable way to do this. A successful
+run prints:
 
-## 5) Connect your gateway to WiFi
-At this point, the procedure is nearly identical to the [WRG1 hack](https://github.com/parasite85/tuya_tygwzw1_hack). Type in your WiFi SSID, your passphrase and connect:
-```
-ATW0=myWifiName
-ATW1=myWifiPassword
-ATWC
+    Enter Auto Upload Mode
+    Uploading.............................................................
+        Upload Image done.
+    All images are sent successfully!
 
-# copy your gateway's IP address out of the log –
-# you'll need it in the next step!
-# … and maybe reboot afterwards
+Erasing first (`Enable Enable` instead of `Enable Disable`) is optional and
+not needed; the flash step writes the regions the images occupy. A full erase
+takes far longer than the flash and prints one dot every 500 ms while it runs.
 
-reboot
-```
+Power-cycle the gateway. The console should show:
 
-## 6) Use your gateway as adapter in Zigbee2MQTT
+    !!!!!!!!!!!!!!!! Hello from KM0 !!!!!!!!!!!!!!!!!!!!!!
+    !!!!!!!!!!!!!!!! Hello from KM4 1!!!!!!!!!!!!!!!!!!!!!!
+    Initializing WIFI ...
+    WIFI initialized
+    Example: socket tx/rx 1
 
-After a reboot, your gateway will automatically connect to your WiFi and prepare everything needed to use it as an adapter in Zigbee2MQTT.
+`Example: socket tx/rx 1` means the TCP bridge is running.
 
-Make sure you see `Example: socket tx/rx 1` in the logs. Then open Zigbee2MQTT configuration in HomeAssistant and fill in the details for your adapter (take the IP you got from the logs in step 5):
-```
-serial:
-  adapter: ezsp
-  baudrate: 115200
-  port: tcp://<your-gateway-ip>:80
-  rtscts: true
-```
-Note that `adapter: ezsp` is Zigbee2MQTT's deprecated driver, kept for
-EmberZNet 7.3 and older. The maintained `ember` driver needs a ZS3L NCP built
-from EmberZNet 7.4.x or newer (EZSP v13); an 8.x NCP additionally wants a
-recent zigbee-herdsman. If you flash a modern NCP in step 7b, switch `adapter`
-to `ember` here.
+### Windows GUI alternative
 
-Start the Zigbee2MQTT addon – and it will try to connect to your gateway. For me, this is working pretty stable now. If you get an error like this, wait a few seconds, restart the addon and try again until it's working :)
-```
-[2024-07-31 15:33:25] error: 	zh:ezsp:uart: --> Error: Error: {"sequence":-1} after 10000ms
-Error: Failure to connect
-    at SerialDriver.resetForReconnect (/app/node_modules/zigbee-herdsman/src/adapter/ezsp/driver/ezsp.ts:341:19)
-    at SerialDriver.emit (node:events:517:28)
-    at /app/node_modules/zigbee-herdsman/src/adapter/ezsp/driver/uart.ts:344:22
-    at Queue.execute (/app/node_modules/zigbee-herdsman/src/utils/queue.ts:35:20)
-    at Socket.<anonymous> (/app/node_modules/zigbee-herdsman/src/adapter/ezsp/driver/uart.ts:152:17)
-```
-## 7) Update your gateway over-the-air
-After flashing this firmware to your gateway, you can update/push new firmware files to your device via WiFi. Please note that you have to update the WBRG1 module (the one this repo is made for) and the ZS3L module separately.
+Enter `reboot uartburn` at the prompt, then use
+[ImageTool.exe](https://github.com/ambiot/ambd_sdk/raw/dev/tools/AmebaD/Image_Tool/ImageTool.exe)
+with .NET Framework 3.5. Chip Select -> AmebaD, baudrate 115200 or 921600.
+To erase manually first: 16 KB at `0x08000000`, 8 KB at `0x08004000`,
+1224 KB at `0x08006000`.
 
-### a) Update WBRG1 module
+![ImageTool](docs/images/imagetool-windows.png)
 
-For updating the WBRG1's Realtek chip, I enabled the [OTA update example](https://github.com/jasperw1996/ambd_sdk_GW018-DM/blob/dev/component/common/example/ota_http/example_ota_http.c) and changed a few lines. (If you don't need it, you can disable it by setting `CONFIG_EXAMPLE_OTA_HTTP` to `0` in [platform_opts.h](https://github.com/jasperw1996/ambd_sdk_GW018-DM/blob/dev/project/realtek_amebaD_va0_example/inc/inc_hp/platform_opts.h)).
+## 6. Connect to WiFi
 
-Set the `HOST` variable in the [OTA update example](https://github.com/jasperw1996/ambd_sdk_GW018-DM/blob/dev/component/common/example/ota_http/example_ota_http.c) to the IP address or hostname of your computer. Then rebuild the firmware. Go to the image folder in `project/realtek_amebaD_va0_example/GCC-RELEASE/project_hp/asdk/image`, open a terminal there and start a webserver of your choice serving that directory:
-```
-# use a simple python http server …
-python3 -m http.server 8080
+At the console prompt. 2.4 GHz only -- the radio has no 5 GHz support.
 
-# … or maybe NGINX with docker or podman
-podman run --rm -it --name nginx-firmware-server -p 8080:80 -v ../image:/usr/share/nginx/html:ro docker.io/nginx:stable
-```
-Now start the gateway, wait until the blue LED stops blinking, press the reset button for 3-4 seconds and release. You should see your gateway connecting to your webserver a few seconds later, downloading the `OTA_All.bin` firmware file in your image folder. It reboots automatically afterwards – and if everything worked fine, you should see the blue LED blinking for a few seconds again.
+    ATW0=your-ssid
+    ATW1=your-passphrase
+    ATWC
 
-### b) Update ZS3L module
-Now that your Zigbee chip's UART connection is exposed via WBRG1 module to your WiFi, you can update its firmware over-the-air, too. We could use the good old "xmodem" protocol for that. 
+The log reports the DHCP address. Give the gateway a static lease; every later
+step addresses it by IP. Then:
 
-If you want to learn more about that, you could enter the bootloader of your Zigbee chip manually and use "xmodem" directly, e. g. with minicom. But there are also a bunch of tools out there to automate this. I successfully tried NabuCasa's [Universal Silabs Flasher](https://github.com/NabuCasa/universal-silabs-flasher):
-```
-universal-silabs-flasher --device socket://<your-gateway-ip>:80 flash --firmware "/path/to/your/gecko-bootloader-firmware-file.gbl"
-```
-I built a new, but still buggy firmware (and also created a .gbl file of the stock firmware you can flash back) [here](https://github.com/MattWestb/EFR32-FW/issues/6#issuecomment-2275368851). But you could also create one yourself using "Simplicity Studio" (to create a .bin file) and "Simplicity Commander" (to convert the .bin to .gbl afterwards).
+    reboot
 
-For me, the flashing process hangs at 100% – it seems to work fine, though: If I wait only a few seconds and then repower the device, the Zigbee chip boots up with the new firmware.
+The bridge listens on **TCP port 80**.
 
-**Please note that there is always a risk that you can (soft-)brick your device while flashing a new firmware to it. Do it at your own risk! You might need your USB UART adapter again or an SWD debugger for the ZS3L module in case anything goes wrong.**
+## 7. Flash the Zigbee module
 
-## Repository notes
+Everything here happens over the network. Check the bridge and read the
+current radio firmware:
 
-**`.gitignore`.** A build leaves ~1700 generated files in the working tree, so
-the repository now ignores them. The rules are deliberately narrow where a
-blanket pattern would be wrong:
+    universal-silabs-flasher --device socket://GATEWAY_IP:80 probe
 
-* `*.o`, `*.d`, `*.su`, `*.i` are matched globally -- the build scatters these
-  both inside `asdk/make/` and alongside the sources under `component/`, and
-  the tree tracks no files with those extensions.
-* Generated `.s` listings are scoped to `asdk/make/` rather than ignored
-  globally, because 19 hand-written `.s` sources are tracked elsewhere in the
-  SDK. For the same reason `*.a` is not ignored at all: 27 prebuilt static
-  libraries are tracked.
-* The extracted toolchain (`project_*/toolchain/{linux,cygwin,darwin}/`) and
-  the concatenated `toolchain/asdk/*.tar.bz2` are ignored, while the split
-  `*.tar.bz2a|b|c` parts stay tracked -- they are the source the build unpacks.
-* `asdk/build/`, `asdk/image/` and the regenerated `inc_*/build_info.h` stamps.
+A stock device reports `EZSP, version '6.5.5.0 build 432'`.
 
-**Executable bits.** The 27 `.sh` scripts under `GCC-RELEASE/` are committed
-mode `100755`, which is the actual fix for the "error 127" described in step 3.
+Pick a firmware:
+
+| Firmware | Zigbee2MQTT adapter | Notes |
+| --- | --- | --- |
+| [EmberZNet 7.4.3](https://github.com/MattWestb/EFR32-FW/issues/6#issuecomment-2347151842) (`G01-pro-ncp-uart-hw.gbl`) | `ember` | Built for the ZS3L. Recommended |
+| [EmberZNet 8.0.1.0](https://github.com/MattWestb/EFR32-FW/issues/6#issuecomment-2275368851) | `ember` | Has reported problems when Zigbee2MQTT restarts |
+| [EmberZNet 6.5.5.0 stock](https://github.com/MattWestb/EFR32-FW/issues/6#issuecomment-2275368851) | none | Roll back to factory |
+
+All are `ncp-uart-hw` builds, which is why `rtscts` is `true` in step 8.
+
+    universal-silabs-flasher --device socket://GATEWAY_IP:80 \
+      flash --firmware G01-pro-ncp-uart-hw.gbl
+
+The upload takes about 75 seconds for a 237 kB image.
+
+**The tool exits non-zero after a successful write.** It reports
+`UploadError: None` or `NoFirmwareError: No firmware exists on the device`,
+and logs `Failed to read firmware metadata`. Judge the result by the progress
+bar reaching 100%, then verify with `probe`. Do not re-flash on the strength
+of the exit code alone.
+
+After a write the module stays in the Gecko bootloader. Start the
+application by sending `2` to the bootloader menu over the same socket:
+
+    python3 -c "import socket; s=socket.create_connection(('GATEWAY_IP',80)); s.sendall(b'\r\n2')"
+
+Then confirm:
+
+    universal-silabs-flasher --device socket://GATEWAY_IP:80 probe
+    # Detected ApplicationType.EZSP, version '7.4.3.0 build 0'
+
+## 8. Zigbee2MQTT
+
+    serial:
+      port: tcp://GATEWAY_IP:80
+      adapter: ember
+      baudrate: 115200
+      rtscts: true
+
+Use `adapter: ember` with EmberZNet 7.4.x and newer. `adapter: ezsp` is
+deprecated and only works with 7.3 and older, so it cannot be used with the
+firmware above.
+
+The first connection often times out. Restart Zigbee2MQTT until it connects.
+
+## Operating notes
+
+**The Zigbee module returns to its bootloader after every WBRG1 reboot.** The
+WBRG1 drives the module's boot-select pin, logged at boot as
+`zigbee_boot_pin(TY_GPIOB4) init output high`. After a gateway reboot or power
+cut, `probe` reports `GECKO_BOOTLOADER, version '1.9.2'` instead of EZSP, and
+Zigbee2MQTT cannot connect until the application is started with the `2`
+command from step 7. Unattended operation needs this fixed in the firmware.
+
+**Port 80 is hardcoded** in the bridge, so the device cannot also serve HTTP.
+
+**Reflashing the Zigbee module ends its Bluetooth mesh function.** One radio,
+one firmware.
+
+**A Zigbee coordinator over WiFi is less reliable than a wired one.**
+Zigbee2MQTT documents this; EZSP does not tolerate packet loss or latency
+jitter well. Keep the gateway within good range of the access point.
+
+## Updating over the air
+
+Both modules can be updated without opening the case again.
+
+WBRG1: set `HOST` in
+`component/common/example/ota_http/example_ota_http.c` to your machine,
+rebuild, serve the image directory, then hold the gateway's reset button for
+3-4 seconds once the blue LED settles. It downloads `OTA_All.bin` itself.
+
+    cd project_hp/asdk/image && python3 -m http.server 8080
+
+The OTA example can be disabled by setting `CONFIG_EXAMPLE_OTA_HTTP` to `0`
+in `project/realtek_amebaD_va0_example/inc/inc_hp/platform_opts.h`.
+
+Zigbee module: as in step 7, over `socket://GATEWAY_IP:80`.
+
+## Recovery
+
+**WBRG1 unbootable.** Reach the console again (`P1` green / `P4` blue) and
+flash from step 5.
+The bootloader lives in a region ImageTool does not erase. Restore the stock
+image from your step 3 backup if needed.
+
+**Zigbee module unbootable.** Flash the stock 6.5.5.0 GBL over the bridge. If
+the bridge is unavailable, use SWD on the blue board's `P3`: `Z-SWDIO`,
+`Z-SWCLK`, `M-RST`, with ground from the console header.
+
+## Known issues
+
+* The Zigbee module needs its application started manually after every host
+  reboot (see Operating notes).
+* The TCP bridge port is not configurable.
+* Zigbee2MQTT's first connection attempt after startup usually fails.
+* `universal-silabs-flasher` reports an error after writes that succeeded.
+
+## Credits
+
+* [jasperw1996/ambd_sdk_GW018-DM](https://github.com/jasperw1996/ambd_sdk_GW018-DM) -- the GW018-DM port this is forked from
+* [parasite85/rtl_firmware](https://github.com/parasite85/rtl_firmware) -- original concept
+* [Seeed-Studio/seeed-ambd-sdk](https://github.com/Seeed-Studio/seeed-ambd-sdk) -- base SDK
+* [ambiot/ambd_arduino](https://github.com/ambiot/ambd_arduino) -- ImageTool
+* [NabuCasa/universal-silabs-flasher](https://github.com/NabuCasa/universal-silabs-flasher)
+* [MattWestb/EFR32-FW issue #6](https://github.com/MattWestb/EFR32-FW/issues/6) -- hardware analysis and the ZS3L firmware images
+* [pvvx RSH-GW018](https://pvvx.github.io/RSH-GW018_DM/) -- pinouts and stock flash images
