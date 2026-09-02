@@ -68,26 +68,70 @@ flash read 0 2097152
 ```
 And the flash will be printed as hex code on your screen. This might take a while. Have a coffee or a nap in the meantime. Exit minicom afterwards by pressing "ctrl" + "a" followed by "x", open the logfile in a text editor, make sure you only keep the dump (starting with `00000000:` and ending with `007ffff0: 7c8bfc05 b410f5f8  14a25132 5f239f20` in my case) and save it. Then convert it into a binary file (maybe there is a much cleaner way to do this – I just could'nt find any):
 ```
-awk -F' ' '{print $2$3$4$5}' myfirmwaredump.cap | xxd -r -p | xxd -e | awk -F' ' '{print $2$3$4$5}' | xxd -r -p wbrg1-firmware.bin
+awk -F' ' '{print $2$3$4$5}' myfirmwaredump.cap | xxd -r -p | xxd -e | awk -F' ' '{print $2$3$4$5}' | xxd -r -p > wbrg1-firmware.bin
 ```
 Congratulations! You now have a backup and theoretically you can restore it (or parts of it) using ImageTool in case anything goes wrong.
 
 ## 3) Build the new firmware
 Now it's time to clone this repo, install the needed dependencies and build the gateway's new firmware out of the AmebaD sdk :)
 ```
-sudo dnf install make glibc-devel.i686 ncurses-compat-libs.i686 
-git clone https://github.com/jasperw1996/ambd_sdk_GW018-DM
+# Dependencies: on a 64-bit host, make is all you actually need.
+sudo dnf install make          # Fedora
+sudo apt install make          # Debian/Ubuntu
+
+# Shallow-clone: the full history is ~1.6 GB.
+git clone --depth 1 --single-branch --branch dev \
+  https://github.com/jasperw1996/ambd_sdk_GW018-DM
+
 cd ambd_sdk_GW018-DM/project/realtek_amebaD_va0_example/GCC-RELEASE/project_lp/
 make all
 cd ../project_hp/
 make all
 ```
-If everything goes fine, you should see a `========== Image manipulating end ==========` at the end of the make process. If you get an "error 127", you may need to change some permissions:
+
+**On the 32-bit packages.** Earlier revisions of this README asked for
+`glibc-devel.i686` and `ncurses-compat-libs.i686`. Those belong to the i686
+fallback path only. The toolchain is not a system package and is not committed
+as a binary: `project_hp/toolchain/asdk/` holds split archives that
+`toolchain/Makefile` concatenates and unpacks on the first build, and it
+branches on `uname -p`. An `x86_64` host therefore gets
+`asdk-6.4.1-linux-newlib-build-3026-x86_64`, which is a genuine 64-bit ELF
+running `arm-none-eabi-gcc 6.4.1` -- no multilib involved. Verified by building
+both cores from a clean clone on x86_64 Ubuntu with only `make` installed.
+
+**If you clone with the GitHub CLI configured for SSH,** plain
+`git clone https://...` can fail with `could not read Username for
+'https://github.com'`, which looks like a private repository but is not. Use
+`gh repo clone jasperw1996/ambd_sdk_GW018-DM -- --depth 1` instead. Note that
+`gh` also adds the `Seeed-Studio/seeed-ambd-sdk` upstream remote and fetches
+its refs, which takes the working copy from ~1.6 GB to ~2.3 GB on disk.
+If everything goes fine, you should see a `========== Image manipulating end ==========` at the end of each make process.
+
+**About "error 127".** It is `command not found`: the bundled helper scripts
+the Makefiles invoke had lost their execute bit in the tree. That is now fixed
+at the source -- the 27 `.sh` scripts under `GCC-RELEASE/` are committed mode
+`100755` -- so the `chmod -R 777 ./` workaround should no longer be necessary.
+If you do hit it, prefer a targeted fix over recursive 777, which also marks
+data files, `.bin` images and `.txt` GDB scripts executable:
 ```
-chmod -R 777 ./
-chmod -R 777 ../project_hp/
+find . -name '*.sh' -exec chmod +x {} \;
+make clean && make all
 ```
-Then clean up the environment with `make clean` and try again. Finally you'll have a bunch if images in the `/adsk/image` subdirectory of `project_lp` and `project_hp`. We'll need three of them in the next step to flash the new firmware to the gateway.
+
+Finally you'll have a bunch of images in the `asdk/image` subdirectory of
+`project_lp` and `project_hp`. Three of them are needed in the next step. For a
+reference build of this branch they come out as:
+
+| image | bytes | from |
+| --- | --- | --- |
+| `km0_boot_all.bin` | 4144 | `project_lp/asdk/image/` |
+| `km4_boot_all.bin` | 4208 | `project_hp/asdk/image/` |
+| `km0_km4_image2.bin` | 663552 | `project_hp/asdk/image/` |
+
+`km0_km4_image2.bin` is written into *both* image directories and the two
+copies are byte-identical, so either will do. The KM4 pass also prints
+`size = 663552` and `checksum 3f83757` as it finishes, which is a free
+sanity check on your own build.
 
 ## 4) Flash the firmware to the gateway
 You can flash the new firmware to the gateway using Realtek ImageTool – there is a GUI for windows, but you might also use the Linux CLI from AmebaD Arduino SDK. Choose whatever you prefer :)
@@ -154,6 +198,12 @@ serial:
   port: tcp://<your-gateway-ip>:80
   rtscts: true
 ```
+Note that `adapter: ezsp` is Zigbee2MQTT's deprecated driver, kept for
+EmberZNet 7.3 and older. The maintained `ember` driver needs a ZS3L NCP built
+from EmberZNet 7.4.x or newer (EZSP v13); an 8.x NCP additionally wants a
+recent zigbee-herdsman. If you flash a modern NCP in step 7b, switch `adapter`
+to `ember` here.
+
 Start the Zigbee2MQTT addon – and it will try to connect to your gateway. For me, this is working pretty stable now. If you get an error like this, wait a few seconds, restart the addon and try again until it's working :)
 ```
 [2024-07-31 15:33:25] error: 	zh:ezsp:uart: --> Error: Error: {"sequence":-1} after 10000ms
@@ -193,3 +243,24 @@ I built a new, but still buggy firmware (and also created a .gbl file of the sto
 For me, the flashing process hangs at 100% – it seems to work fine, though: If I wait only a few seconds and then repower the device, the Zigbee chip boots up with the new firmware.
 
 **Please note that there is always a risk that you can (soft-)brick your device while flashing a new firmware to it. Do it at your own risk! You might need your USB UART adapter again or an SWD debugger for the ZS3L module in case anything goes wrong.**
+
+## Repository notes
+
+**`.gitignore`.** A build leaves ~1700 generated files in the working tree, so
+the repository now ignores them. The rules are deliberately narrow where a
+blanket pattern would be wrong:
+
+* `*.o`, `*.d`, `*.su`, `*.i` are matched globally -- the build scatters these
+  both inside `asdk/make/` and alongside the sources under `component/`, and
+  the tree tracks no files with those extensions.
+* Generated `.s` listings are scoped to `asdk/make/` rather than ignored
+  globally, because 19 hand-written `.s` sources are tracked elsewhere in the
+  SDK. For the same reason `*.a` is not ignored at all: 27 prebuilt static
+  libraries are tracked.
+* The extracted toolchain (`project_*/toolchain/{linux,cygwin,darwin}/`) and
+  the concatenated `toolchain/asdk/*.tar.bz2` are ignored, while the split
+  `*.tar.bz2a|b|c` parts stay tracked -- they are the source the build unpacks.
+* `asdk/build/`, `asdk/image/` and the regenerated `inc_*/build_info.h` stamps.
+
+**Executable bits.** The 27 `.sh` scripts under `GCC-RELEASE/` are committed
+mode `100755`, which is the actual fix for the "error 127" described in step 3.
