@@ -1,2 +1,15 @@
 # Declare files that will always have CRLF line endings on checkout.
 *.* binary eol=lf
+# Re-enable textual diffs for the files humans actually review. The blanket
+# `*.* binary` rule above applies -diff to everything with a dot, so changes
+# to documentation, scripts and sources render as "Bin" in git diff and show
+# no reviewable content in pull requests. Setting `diff` alone restores
+# readable diffs without re-enabling end-of-line conversion.
+*.md            diff
+*.txt           diff
+*.sh            diff
+*.mk            diff
+*.c             diff
+*.h             diff
+.gitignore      diff
+.gitattributes  diff
