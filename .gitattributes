@@ -8,6 +8,7 @@
 *.md            diff
 *.txt           diff
 *.sh            diff
+*.py            diff
 *.mk            diff
 *.c             diff
 *.h             diff

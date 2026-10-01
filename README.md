@@ -10,6 +10,11 @@ regardless of vendor.
 unprotected and reachable over the TCP bridge once the WiFi firmware is
 running, so its firmware is flashed over the network.
 
+The blue board can also be converted into a plain USB coordinator, with the
+WiFi module held off and the Zigbee radio wired straight to a USB serial
+adapter. That version is more reliable and does need an SWD probe; see
+*Wired USB coordinator*.
+
 Based on [parasite85/rtl_firmware](https://github.com/parasite85/rtl_firmware),
 adapted for AmebaD, on top of
 [Seeed-Studio/seeed-ambd-sdk](https://github.com/Seeed-Studio/seeed-ambd-sdk).
@@ -56,8 +61,11 @@ The blue board's `P3` carries, in silkscreen order:
     P3:  Z-SWDIO  Z-SWCLK  433SWDIO  433SWCLK  M-RST  RXD  TXD
 
 All seven are signals -- **there is no GND or VCC on P3**, so take ground
-from the console header. P3 is only needed to recover the Zigbee module over
-SWD. No 433 MHz module is fitted, so the `433*` pins are unused.
+from the console header. `RXD` and `TXD` are the ZS3L's own UART, `PA06` and
+`PA05`; they are what the wired coordinator below runs on. `Z-SWDIO` and
+`Z-SWCLK` are **not connected to the ZS3L**, so SWD has to be soldered to the
+module's `PA02` and `PA01` pads. No 433 MHz module is fitted, so the `433*`
+pins are unused.
 
 ## What you need
 
@@ -344,6 +352,114 @@ firmware above.
 
 The first connection often times out. Restart Zigbee2MQTT until it connects.
 
+## Wired USB coordinator
+
+An alternative to steps 2-8 on the blue `JZZWG-TY2.0` board. The ZS3L is
+driven straight from a USB serial adapter and the WBRG1 is held off, so
+neither the WiFi module nor the TCP bridge is involved. Zigbee2MQTT sees an
+ordinary serial port, which is what it is designed for and what the note
+under *Operating notes* recommends.
+
+This route needs an SWD probe. An ST-LINK/V2 works, including the one on an
+STM32 Discovery board (pull both `CN3` jumpers to free `CN2` for an
+external target).
+
+### Wiring
+
+`P3`'s `RXD` and `TXD` are wired to the ZS3L's own UART, `PA06` and `PA05`.
+That is the port the radio firmware talks on.
+
+| USB-UART adapter | Board |
+| --- | --- |
+| `GND` | `P4` `GND` |
+| `RXD` | `P3` `TXD` |
+| `TXD` | `P3` `RXD`, through the 4k7 / 10k divider from step 1 if the adapter is 5 V |
+
+Tie `P4` `CHIP_EN` to `GND`. That holds the WBRG1 in reset for good, and is
+what frees the UART: left running it drives the same two lines.
+
+`P3` has no ground pin, so ground comes from `P4`. Power the gateway from its
+USB-C connector as before and leave `VCC` unconnected.
+
+For SWD, `P3`'s `Z-SWDIO` and `Z-SWCLK` are **not connected to the ZS3L**.
+Solder to the module's own pads instead: `PA02` is SWDIO, `PA01` is SWCLK.
+
+![Board wired for USB](docs/images/wired-coordinator-board.jpg)
+
+*Blue `JZZWG-TY2.0` with wires connected to soldered headers,
+and the USB serial adapter taped into the other half of the case.
+The SWD connection is only needed while flashing and can come off afterwards.*
+
+![Reassembled in the case](docs/images/wired-coordinator-case.jpg)
+
+*Everything fits back in the original case. The gateway takes power from a
+3.3 V pin on the USB serial adapter.*
+
+### Firmware
+
+The radio needs a build that matches this wiring: UART on `PA05` / `PA06` and
+**software flow control**, because the ZS3L exposes no RTS/CTS. The published
+ZS3L images are all `ncp-uart-hw` and stay silent here, as do Sonoff's
+Dongle-LMG21 builds, which drive `PB01` / `PB00`.
+
+Build one with
+[Nerivec/silabs-firmware-builder](https://github.com/Nerivec/silabs-firmware-builder).
+Copy `manifests/sonoff/sonoff_dongle-lmg21_zigbee_ncp.yaml` -- the same
+EFR32MG21, already `fw_variant: sw_flow` -- to
+`manifests/tuya/tuya_zs3l_zigbee_ncp.yaml` and change the name and four pin
+values, nothing else:
+
+    c_defines:
+      SL_IOSTREAM_USART_VCOM_TX_PORT: SL_GPIO_PORT_A
+      SL_IOSTREAM_USART_VCOM_TX_PIN: 5
+      SL_IOSTREAM_USART_VCOM_RX_PORT: SL_GPIO_PORT_A
+      SL_IOSTREAM_USART_VCOM_RX_PIN: 6
+
+The image build fetches the Simplicity Commander CLI with `aria2c`, which
+silabs.com answers with 403. Download
+`slt-cli-1.1.0-linux-x64.zip` from `https://www.silabs.com/documents/public/software/`
+with plain `curl`, then edit the `Dockerfile` to `COPY` it in rather than
+download it. Build and run:
+
+    docker build -t silabs-fw-builder .
+    docker run --rm -v "$PWD":/repo silabs-fw-builder \
+      --manifest manifests/tuya/tuya_zs3l_zigbee_ncp.yaml \
+      --build-dir build --output-dir outputs \
+      --output gbl --output hex --output out
+
+### Flash over SWD
+
+`tools/msc_flash.py` programs the `.hex` by driving the EFR32MG21's Memory
+System Controller directly. pyOCD ships no flash algorithm for this part and
+Silicon Labs gates the CMSIS pack, so nothing off the shelf can write it.
+
+Back up first -- the stock image is not published anywhere:
+
+    pyocd cmd -t cortex_m -c "savemem 0x0 0xC0000 zs3l_backup.bin"
+
+Then write, leaving the bootloader in pages 0 and 1 alone:
+
+    pip install pyocd intelhex
+    python3 tools/msc_flash.py outputs/tuya_zs3l_zigbee_ncp_*.hex --min-addr 0x4000
+
+It erases, writes and reads back every byte, ending in `VERIFY: OK`.
+Power-cycle, then confirm over the serial adapter:
+
+    universal-silabs-flasher --device /dev/ttyUSB0 probe
+    # Detected ApplicationType.EZSP, version '9.1.1.0 build 0' at 115200 baudrate
+
+### Zigbee2MQTT
+
+    serial:
+      port: /dev/serial/by-id/usb-1a86_USB_Single_Serial_XXXXXXXXXX-if00
+      adapter: ember
+      baudrate: 115200
+      rtscts: false
+
+`rtscts` is `false` here, unlike step 8: this firmware is `ncp-uart-sw`. Use
+the `/dev/serial/by-id/` path rather than `/dev/ttyUSB0` so the port survives
+reboots and replugging.
+
 ## Operating notes
 
 **Port 80 is hardcoded** in the bridge, so the device cannot also serve HTTP.
@@ -353,7 +469,8 @@ one firmware.
 
 **A Zigbee coordinator over WiFi is less reliable than a wired one.**
 Zigbee2MQTT documents this; EZSP does not tolerate packet loss or latency
-jitter well. Keep the gateway within good range of the access point.
+jitter well. Keep the gateway within good range of the access point, or build
+it as a *Wired USB coordinator* instead.
 
 ## Updating over the air
 
@@ -379,8 +496,10 @@ The bootloader lives in a region ImageTool does not erase. Restore the stock
 image from your step 3 backup if needed.
 
 **Zigbee module unbootable.** Flash the stock 6.5.5.0 GBL over the bridge. If
-the bridge is unavailable, use SWD on the blue board's `P3`: `Z-SWDIO`,
-`Z-SWCLK`, `M-RST`, with ground from the console header.
+the bridge is unavailable, use SWD on the module's `PA02` (SWDIO) and `PA01`
+(SWCLK) pads with ground from the console header, and write the image with
+`tools/msc_flash.py`. The `Z-SWDIO` / `Z-SWCLK` pins on `P3` do not reach the
+module.
 
 ## Known issues
 
